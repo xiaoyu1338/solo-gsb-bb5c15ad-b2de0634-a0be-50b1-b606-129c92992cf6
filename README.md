@@ -12,7 +12,10 @@ Content-Transfer-Encoding、字符集、RFC 2047 编码字、RFC 2231 参数）�
 - 损坏的边界、重复参数、无法解码的字符集 / base64 / quoted-printable
   等情况返回 **HTTP 422**，错误体带 **`node_path` 精确定位到 MIME 节点**，
   且**不会写入任何半成品数据**；
-- 相同指纹重复提交是幂等的（返回同一 id，`created=false`）。
+- 相同指纹重复提交是幂等的（返回同一 id，`created=false`）；
+- 所有非文本叶子的**解码后字节**进入**内容寻址附件库**：按 SHA-256
+  去重只存一份，每次出现记录引用（消息、节点路径、解码文件名、
+  disposition），可分页检索并支持 HTTP Range 下载。
 
 技术栈：FastAPI + SQLite（标准库 `sqlite3`，无 ORM），无第三方 MIME
 解析库——解析器按 RFC 严格手工实现，刻意不使用容错的 Python `email` 包。
@@ -23,10 +26,10 @@ Content-Transfer-Encoding、字符集、RFC 2047 编码字、RFC 2231 参数）�
 app/
   main.py        FastAPI 路由与启动初始化
   mimeparser.py  严格 MIME/RFC 5322 解析、传输解码、规范化与指纹
-  database.py    SQLite 建表、事务化写入、消息/节点查询
+  database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     响应模型
-tests/           86 个 pytest 用例（指纹稳定性、损坏输入、HTTP 端到端）
+tests/           107 个 pytest 用例（指纹稳定性、损坏输入、附件库、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -94,6 +97,8 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/tree` | **嵌套 MIME 树** |
 | GET | `/messages/{id}/nodes` | 全部节点（扁平，children 为路径） |
 | GET | `/messages/{id}/nodes/{path}` | 单个节点详情（头字段、文本/二进制哈希） |
+| GET | `/attachments` | 附件实体列表（`hash`、`filename`、`media_type` 过滤 + 分页） |
+| GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 Range） |
 
 节点路径规则：根节点为 `""`，子节点为 1 基序号 `1`、`2`，
 深层为 `1/2` 这样的物化路径。根节点详情用末尾斜杠：
@@ -106,7 +111,65 @@ curl http://localhost:8000/messages/1/nodes/2/1     # 第 2 部分里的封装�
 ```
 
 文本叶子的 `text` 是按声明字符集解码、NFC 规范化、换行统一为 `\n`
-后的内容；非文本叶子不回传字节，只给 `blob_sha256` 与 `blob_length`。
+后的内容；非文本叶子不回传字节，只给 `blob_sha256` 与 `blob_length`
+——原始字节从附件库下载（见下节）。
+
+## 附件库（内容寻址）
+
+归档时，所有**非文本叶子**的解码后字节按 **SHA-256 去重**保存到
+`attachments` 表：同一内容无论出现在多少封邮件、多少个节点里，
+都只存一份。每次出现在 `attachment_refs` 表记录一条引用：
+`message_id`、`node_path`、解码文件名（优先 `Content-Disposition`
+的 `filename`，回退 `Content-Type` 的 `name`，RFC 2047/2231 已解码）
+与 `disposition`。消息、节点、附件实体与引用在**同一事务**提交；
+重复归档同一封邮件不会增加任何实体或引用。
+
+```bash
+# 分页检索：hash（大小写不敏感）、filename、media_type 均可精确过滤；
+# filename / media_type 匹配实体的任一出现位置
+curl 'http://localhost:8000/attachments?media_type=application/pdf&limit=20'
+```
+
+每个列表项包含 `ref_count`（引用次数）与 `occurrences`（全部出现位置）：
+
+```json
+{
+  "items": [
+    {
+      "sha256": "ad831eb1…5d",
+      "size_bytes": 1024,
+      "media_type": "application/pdf",
+      "ref_count": 2,
+      "created_at": "2026-09-21T08:30:00+00:00",
+      "occurrences": [
+        {"message_id": 1, "node_path": "2", "filename": "report.pdf",
+         "disposition": "attachment", "content_type": "application/pdf"},
+        {"message_id": 7, "node_path": "3", "filename": "report.pdf",
+         "disposition": "attachment", "content_type": "application/pdf"}
+      ]
+    }
+  ],
+  "total": 1, "limit": 50, "offset": 0
+}
+```
+
+下载原始解码字节，支持**单段** `bytes` Range：
+
+```bash
+curl -OJ http://localhost:8000/attachments/ad831eb1…5d/content
+curl -H 'Range: bytes=0-1023'  …/content   # 206 + Content-Range: bytes 0-1023/<size>
+curl -H 'Range: bytes=-4096'   …/content   # 最后 4096 字节
+```
+
+- 合法范围返回 `206` 与 `Content-Range`；无 Range 返回 `200` 全量；
+- 越界、多段（`bytes=0-1,4-8`）或无法解析的范围返回 `416`，
+  并带 `Content-Range: bytes */<size>`；
+- 非 `bytes` 单位的 Range 头按 RFC 9110 忽略，返回 `200` 全量；
+- 响应带 `Accept-Ranges: bytes`，有文件名时带
+  `Content-Disposition: attachment; filename*=…`。
+
+旧版数据库文件无需迁移：启动时自动补齐 `attachments` /
+`attachment_refs` 两张新表（对存量邮件不回填，仅新归档产生附件）。
 
 ## 错误响应
 
@@ -124,8 +187,8 @@ curl http://localhost:8000/messages/1/nodes/2/1     # 第 2 部分里的封装�
 ```
 
 `node_path` 指向出问题的 MIME 节点（根节点为 `""`）。解析在写库之前
-**完整完成**，因此失败请求不会在 `messages` / `nodes` 表中留下任何行；
-写库本身也在单事务内，中途出错整体回滚。
+**完整完成**，因此失败请求不会在 `messages` / `nodes` / `attachments`
+等任何表中留下行；写库本身也在单事务内，中途出错整体回滚。
 
 错误码：
 

@@ -1,14 +1,19 @@
 """SQLite 存储层。
 
-两张表：
+四张表：
 
 * ``messages``：一封邮件一行，保存指纹、原始字节哈希、规范化 JSON、
   根节点信息与时间戳；
 * ``nodes``：MIME 树节点，按 :attr:`MIMENode.path` 物化路径存储，
-  可直接按 ``message_id + path`` 查询任意节点。
+  可直接按 ``message_id + path`` 查询任意节点；
+* ``attachments``：内容寻址附件库——非文本叶子的解码后字节按
+  SHA-256 去重，一份内容只存一行；
+* ``attachment_refs``：附件实体的每次出现（引用），记录消息 id、
+  节点路径、解码文件名与 disposition。
 
 写入在 *单个事务* 中完成：解析失败时根本不会进入此模块；写入中途
-出错会整体回滚，数据库里不会留下半成品。
+出错会整体回滚，数据库里不会留下半成品。建表语句全部幂等
+（``IF NOT EXISTS``），已有数据库文件启动时自动补齐新表。
 """
 
 from __future__ import annotations
@@ -56,6 +61,33 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE INDEX IF NOT EXISTS idx_nodes_message ON nodes(message_id);
 CREATE INDEX IF NOT EXISTS idx_messages_fingerprint ON messages(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    sha256          TEXT PRIMARY KEY,
+    size_bytes      INTEGER NOT NULL,
+    media_type      TEXT NOT NULL,
+    content         BLOB NOT NULL,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attachment_refs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256          TEXT NOT NULL
+                        REFERENCES attachments(sha256) ON DELETE CASCADE,
+    message_id      INTEGER NOT NULL
+                        REFERENCES messages(id) ON DELETE CASCADE,
+    node_path       TEXT NOT NULL,
+    filename        TEXT,
+    disposition     TEXT,
+    content_type    TEXT NOT NULL,
+    UNIQUE(sha256, message_id, node_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachment_refs_sha ON attachment_refs(sha256);
+CREATE INDEX IF NOT EXISTS idx_attachment_refs_message
+    ON attachment_refs(message_id);
+CREATE INDEX IF NOT EXISTS idx_attachment_refs_filename
+    ON attachment_refs(filename);
 """
 
 
@@ -170,6 +202,8 @@ def _insert_message(
         message_id = int(cur.lastrowid)
         for node, depth, position in _walk(root):
             _insert_node(conn, message_id, node, depth, position)
+            if node.is_leaf and not node.is_text:
+                _save_attachment(conn, message_id, node)
         return message_id, True
 
 
@@ -236,6 +270,57 @@ def _insert_node(
     )
 
 
+def _save_attachment(
+    conn: sqlite3.Connection, message_id: int, node: MIMENode
+) -> None:
+    """把非文本叶子的解码字节写入内容寻址附件库（与消息同事务）。
+
+    实体按解码内容的 SHA-256 去重（``INSERT OR IGNORE``），每次出现
+    追加一条引用：消息 id、节点路径、解码文件名与 disposition。
+    重复归档同一封邮件在指纹层面已幂等返回，不会走到这里，因此
+    实体与引用都不会因重复提交而增加。
+    """
+
+    blob = node.blob or b""
+    digest = hashlib.sha256(blob).hexdigest()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO attachments
+            (sha256, size_bytes, media_type, content, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            digest,
+            len(blob),
+            node.media_type,
+            blob,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    # 解码文件名：优先 Content-Disposition 的 filename 参数，
+    # 回退到 Content-Type 的 name 参数（均为解析期已完成
+    # RFC 2047/2231 解码的值）。
+    filename = node.disposition_params.get("filename")
+    if filename is None:
+        filename = node.content_type_params.get("name")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO attachment_refs
+            (sha256, message_id, node_path, filename, disposition,
+             content_type)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            digest,
+            message_id,
+            node.path,
+            filename,
+            node.disposition,
+            node.media_type,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 查询
 # ---------------------------------------------------------------------------
@@ -288,5 +373,111 @@ def list_nodes(conn: sqlite3.Connection, message_id: int) -> list[sqlite3.Row]:
         conn.execute(
             "SELECT * FROM nodes WHERE message_id = ? ORDER BY id",
             (message_id,),
+        ).fetchall()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 附件库查询
+# ---------------------------------------------------------------------------
+
+
+def _attachment_where(
+    sha256: Optional[str],
+    filename: Optional[str],
+    media_type: Optional[str],
+) -> tuple[str, list[str]]:
+    """组装附件检索的 WHERE 子句。
+
+    * ``sha256``：实体哈希精确匹配（大小写不敏感，库中一律小写）；
+    * ``filename`` / ``media_type``：按 *任一出现位置* 的解码文件名 /
+      媒体类型匹配（同一内容在不同消息里可能声明不同类型）。
+    """
+
+    clauses: list[str] = []
+    params: list[str] = []
+    if sha256:
+        clauses.append("a.sha256 = ?")
+        params.append(sha256.lower())
+    if filename is not None:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM attachment_refs r"
+            " WHERE r.sha256 = a.sha256 AND r.filename = ?)"
+        )
+        params.append(filename)
+    if media_type:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM attachment_refs r"
+            " WHERE r.sha256 = a.sha256 AND r.content_type = ?)"
+        )
+        params.append(media_type.lower())
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return where, params
+
+
+def list_attachments(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    offset: int,
+    sha256: Optional[str] = None,
+    filename: Optional[str] = None,
+    media_type: Optional[str] = None,
+) -> list[sqlite3.Row]:
+    where, params = _attachment_where(sha256, filename, media_type)
+    return list(
+        conn.execute(
+            f"""
+            SELECT a.sha256, a.size_bytes, a.media_type, a.created_at,
+                   (SELECT COUNT(*) FROM attachment_refs r
+                     WHERE r.sha256 = a.sha256) AS ref_count
+            FROM attachments a{where}
+            ORDER BY a.created_at DESC, a.sha256
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
+    )
+
+
+def count_attachments(
+    conn: sqlite3.Connection,
+    *,
+    sha256: Optional[str] = None,
+    filename: Optional[str] = None,
+    media_type: Optional[str] = None,
+) -> int:
+    where, params = _attachment_where(sha256, filename, media_type)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM attachments a{where}", params
+    ).fetchone()
+    return int(row["c"])
+
+
+def get_attachment(
+    conn: sqlite3.Connection, sha256: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT sha256, size_bytes, media_type, content, created_at
+        FROM attachments WHERE sha256 = ?
+        """,
+        (sha256.lower(),),
+    ).fetchone()
+
+
+def list_attachment_refs(
+    conn: sqlite3.Connection, sha256: str
+) -> list[sqlite3.Row]:
+    """某附件实体的全部出现位置，按归档顺序（refs.id）返回。"""
+
+    return list(
+        conn.execute(
+            """
+            SELECT message_id, node_path, filename, disposition,
+                   content_type
+            FROM attachment_refs WHERE sha256 = ? ORDER BY id
+            """,
+            (sha256,),
         ).fetchall()
     )

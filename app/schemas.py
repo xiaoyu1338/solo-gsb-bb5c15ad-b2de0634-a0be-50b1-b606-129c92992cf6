@@ -85,6 +85,32 @@ class NodeDetailResponse(BaseModel):
     node: NodeDetail
 
 
+class AttachmentOccurrence(BaseModel):
+    """附件实体的一次出现（引用）。"""
+
+    message_id: int
+    node_path: str
+    filename: Optional[str] = None
+    disposition: Optional[str] = None
+    content_type: str
+
+
+class AttachmentSummary(BaseModel):
+    sha256: str
+    size_bytes: int
+    media_type: str
+    ref_count: int
+    created_at: str
+    occurrences: list[AttachmentOccurrence]
+
+
+class AttachmentListResponse(BaseModel):
+    items: list[AttachmentSummary]
+    total: int
+    limit: int
+    offset: int
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str
