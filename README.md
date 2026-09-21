@@ -12,7 +12,10 @@ Content-Transfer-Encoding、字符集、RFC 2047 编码字、RFC 2231 参数）�
 - 损坏的边界、重复参数、无法解码的字符集 / base64 / quoted-printable
   等情况返回 **HTTP 422**，错误体带 **`node_path` 精确定位到 MIME 节点**，
   且**不会写入任何半成品数据**；
-- 相同指纹重复提交是幂等的（返回同一 id，`created=false`）。
+- 相同指纹重复提交是幂等的（返回同一 id，`created=false`）；
+- 所有非文本叶子的解码字节进入**内容寻址附件库**（按 SHA-256 去重），
+  记录每次出现的 `message_id` / `node_path` / 解码文件名 / disposition，
+  支持分页检索与带 `Range` 的下载。
 
 技术栈：FastAPI + SQLite（标准库 `sqlite3`，无 ORM），无第三方 MIME
 解析库——解析器按 RFC 严格手工实现，刻意不使用容错的 Python `email` 包。
@@ -23,10 +26,10 @@ Content-Transfer-Encoding、字符集、RFC 2047 编码字、RFC 2231 参数）�
 app/
   main.py        FastAPI 路由与启动初始化
   mimeparser.py  严格 MIME/RFC 5322 解析、传输解码、规范化与指纹
-  database.py    SQLite 建表、事务化写入、消息/节点查询
+  database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     响应模型
-tests/           86 个 pytest 用例（指纹稳定性、损坏输入、HTTP 端到端）
+tests/           112 个 pytest 用例（指纹稳定性、损坏输入、附件库、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -94,6 +97,8 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/tree` | **嵌套 MIME 树** |
 | GET | `/messages/{id}/nodes` | 全部节点（扁平，children 为路径） |
 | GET | `/messages/{id}/nodes/{path}` | 单个节点详情（头字段、文本/二进制哈希） |
+| GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
+| GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
 
 节点路径规则：根节点为 `""`，子节点为 1 基序号 `1`、`2`，
 深层为 `1/2` 这样的物化路径。根节点详情用末尾斜杠：
@@ -107,6 +112,68 @@ curl http://localhost:8000/messages/1/nodes/2/1     # 第 2 部分里的封装�
 
 文本叶子的 `text` 是按声明字符集解码、NFC 规范化、换行统一为 `\n`
 后的内容；非文本叶子不回传字节，只给 `blob_sha256` 与 `blob_length`。
+
+## 内容寻址附件库
+
+归档时，所有**非文本叶子**（`kind == "blob"`，含整封邮件本身就是二进制、
+以及 `message/rfc822` 封装报文内部的附件）的**解码后字节**按 SHA-256
+去重存入 `attachments` 表；每次出现（哪封邮件的哪个节点、解码后的文件名、
+disposition、媒体类型）记入 `attachment_refs` 表。消息、节点、附件实体
+与引用在**同一事务**提交；重复归档同一指纹的邮件不会新增任何实体或引用。
+
+- 同一内容在同一封邮件出现多次、或出现在多封邮件中，只存一份字节，
+  `reference_count` 与 `occurrences` 反映全部出现位置；
+- 解码文件名取 `Content-Disposition` 的 `filename`（含 RFC 2231
+  `filename*=` 形式），缺省时回退 `Content-Type` 的 `name`；
+- 新表用 `CREATE TABLE IF NOT EXISTS` 建立，启动时对已有 SQLite 库
+  幂等升级；升级前归档的邮件未留存附件字节，不会回溯补录。
+
+### 检索
+
+```bash
+curl 'http://localhost:8000/attachments?limit=20&offset=0'
+curl 'http://localhost:8000/attachments?sha256=c1e372ae'      # 哈希前缀（完整 64 位即精确）
+curl 'http://localhost:8000/attachments?filename=发票'         # 文件名子串（ASCII 大小写不敏感）
+curl 'http://localhost:8000/attachments?media_type=image/png' # 出现位置的媒体类型
+```
+
+每个列表项：
+
+```json
+{
+  "sha256": "c1e372ae…8001",
+  "size_bytes": 45,
+  "media_type": "image/png",
+  "reference_count": 2,
+  "created_at": "2026-09-21T03:06:15.676328+00:00",
+  "occurrences": [
+    {"message_id": 2, "node_path": "2", "filename": "s.png",
+     "disposition": "attachment", "media_type": "image/png"},
+    {"message_id": 5, "node_path": "1/2", "filename": "copy.png",
+     "disposition": "attachment", "media_type": "image/png"}
+  ]
+}
+```
+
+`media_type`（实体级）为首次归档时的媒体类型；`filename` / `media_type`
+过滤按**任一出现位置**匹配。
+
+### 下载
+
+```bash
+curl -O http://localhost:8000/attachments/c1e372ae…/content
+curl -H 'Range: bytes=0-99'  http://localhost:8000/attachments/c1e372ae…/content   # 206
+curl -H 'Range: bytes=100-'  http://localhost:8000/attachments/c1e372ae…/content   # 206
+curl -H 'Range: bytes=-50'   http://localhost:8000/attachments/c1e372ae…/content   # 206（最后 50 字节）
+```
+
+- 不带 `Range`：`200` 返回完整解码字节，`Content-Type` 为实体媒体类型，
+  响应带 `Accept-Ranges: bytes`；
+- 合法单段范围：`206` + `Content-Range: bytes start-end/size`，
+  末端超出大小按 RFC 7233 收敛；
+- 越界、多段（`bytes=0-1,3-4`）或非法范围：`416` +
+  `Content-Range: bytes */size`；
+- 未知哈希：`404`。
 
 ## 错误响应
 
@@ -124,8 +191,8 @@ curl http://localhost:8000/messages/1/nodes/2/1     # 第 2 部分里的封装�
 ```
 
 `node_path` 指向出问题的 MIME 节点（根节点为 `""`）。解析在写库之前
-**完整完成**，因此失败请求不会在 `messages` / `nodes` 表中留下任何行；
-写库本身也在单事务内，中途出错整体回滚。
+**完整完成**，因此失败请求不会在 `messages` / `nodes` / `attachments` /
+`attachment_refs` 表中留下任何行；写库本身也在单事务内，中途出错整体回滚。
 
 错误码：
 

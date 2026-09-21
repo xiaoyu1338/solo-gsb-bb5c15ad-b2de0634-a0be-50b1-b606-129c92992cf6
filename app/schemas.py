@@ -85,6 +85,32 @@ class NodeDetailResponse(BaseModel):
     node: NodeDetail
 
 
+class AttachmentOccurrence(BaseModel):
+    """附件的一次出现：哪封邮件的哪个节点、以什么文件名/处置方式。"""
+
+    message_id: int
+    node_path: str
+    filename: Optional[str] = None
+    disposition: Optional[str] = None
+    media_type: str
+
+
+class AttachmentSummary(BaseModel):
+    sha256: str
+    size_bytes: int
+    media_type: str  # 首次归档时的媒体类型
+    reference_count: int
+    created_at: str
+    occurrences: list[AttachmentOccurrence]
+
+
+class AttachmentListResponse(BaseModel):
+    items: list[AttachmentSummary]
+    total: int
+    limit: int
+    offset: int
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str
